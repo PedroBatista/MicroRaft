@@ -18,11 +18,13 @@
 package io.microraft.impl;
 
 import static io.microraft.MembershipChangeMode.ADD_OR_PROMOTE_TO_FOLLOWER;
+import static io.microraft.MembershipChangeMode.DEMOTE_TO_LEARNER;
 import static io.microraft.MembershipChangeMode.REMOVE_MEMBER;
 import static io.microraft.RaftRole.FOLLOWER;
 import static io.microraft.RaftRole.LEARNER;
 import static io.microraft.impl.local.LocalRaftGroup.IN_MEMORY_RAFT_STATE_STORE_FACTORY;
 import static io.microraft.impl.local.SimpleStateMachine.applyValue;
+import static io.microraft.test.util.AssertionUtils.allTheTime;
 import static io.microraft.test.util.AssertionUtils.eventually;
 import static io.microraft.test.util.RaftTestUtils.TEST_RAFT_CONFIG;
 import static io.microraft.test.util.RaftTestUtils.getCommitIndex;
@@ -395,6 +397,46 @@ public class PersistenceTest extends BaseTest {
                 assertThat(values.get(i)).isEqualTo("val" + i);
             }
         });
+    }
+
+    @Timeout(300)
+    @Test
+    public void when_demotedFollowerIsRestarted_then_itRestoresLearnerRoleAndDoesNotCampaign() {
+        group = LocalRaftGroup.newBuilder(3).setConfig(TEST_RAFT_CONFIG)
+                .setRaftStoreFactory(IN_MEMORY_RAFT_STATE_STORE_FACTORY).start();
+
+        RaftNodeImpl leader = group.waitUntilLeaderElected();
+        leader.replicate(applyValue("val0")).join();
+
+        RaftNodeImpl demoted = group.getAnyNodeExcept(leader.getLocalEndpoint());
+        leader.changeMembership(demoted.getLocalEndpoint(), DEMOTE_TO_LEARNER,
+                getCommittedGroupMembers(leader).getLogIndex()).join();
+        eventually(() -> assertThat(getRole(demoted)).isEqualTo(LEARNER));
+
+        group.terminateNode(demoted.getLocalEndpoint());
+        InMemoryRaftStore stateStore = getRaftStore(demoted);
+        RestoredRaftState terminatedState = stateStore.toRestoredRaftState();
+
+        leader.replicate(applyValue("val1")).join();
+        int term = getTerm(leader);
+
+        RaftNodeImpl restartedNode = group.restoreNode(terminatedState, stateStore);
+
+        assertThat(getRole(restartedNode)).isEqualTo(LEARNER);
+        assertThat(getEffectiveGroupMembers(restartedNode).getVotingMembers())
+                .doesNotContain(restartedNode.getLocalEndpoint());
+
+        eventually(() -> {
+            assertThat(restartedNode.getLeaderEndpoint()).isEqualTo(leader.getLocalEndpoint());
+            assertThat(getCommitIndex(restartedNode)).isEqualTo(getCommitIndex(leader));
+            assertThat(group.getStateMachine(restartedNode.getLocalEndpoint()).valueList()).containsExactly("val0",
+                    "val1");
+        });
+
+        allTheTime(() -> {
+            assertThat(getRole(restartedNode)).isEqualTo(LEARNER);
+            assertThat(getTerm(leader)).isEqualTo(term);
+        }, 3);
     }
 
     @Timeout(300)

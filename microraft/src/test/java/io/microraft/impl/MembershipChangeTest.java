@@ -36,6 +36,7 @@ import static io.microraft.test.util.RaftTestUtils.getLastLogOrSnapshotEntry;
 import static io.microraft.test.util.RaftTestUtils.getRole;
 import static io.microraft.test.util.RaftTestUtils.getSnapshotEntry;
 import static io.microraft.test.util.RaftTestUtils.getStatus;
+import static io.microraft.test.util.RaftTestUtils.getTerm;
 import static io.microraft.test.util.RaftTestUtils.majority;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -260,6 +261,90 @@ public class MembershipChangeTest extends BaseTest {
         assertThatThrownBy(
                 () -> leader.changeMembership(newNode.getLocalEndpoint(), DEMOTE_TO_LEARNER, index).join())
                 .hasCauseInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Timeout(300)
+    @Test
+    public void when_partitionedFollowerIsDemoted_then_itBecomesLearnerAfterHealingWithoutDisruption() {
+        group = LocalRaftGroup.newBuilder(3).setConfig(TEST_RAFT_CONFIG).start();
+
+        RaftNodeImpl leader = group.waitUntilLeaderElected();
+        leader.replicate(applyValue("val")).join();
+
+        RaftNodeImpl demoted = group.getAnyNodeExcept(leader.getLocalEndpoint());
+        group.splitMembers(demoted.getLocalEndpoint());
+
+        // the remaining two voters still form a quorum
+        leader.changeMembership(demoted.getLocalEndpoint(), DEMOTE_TO_LEARNER,
+                getCommittedGroupMembers(leader).getLogIndex()).join();
+        int term = getTerm(leader);
+
+        group.merge();
+
+        eventually(() -> {
+            assertThat(getRole(demoted)).isEqualTo(LEARNER);
+            assertThat(getCommittedGroupMembers(demoted).getLogIndex())
+                    .isEqualTo(getCommittedGroupMembers(leader).getLogIndex());
+            assertThat(getCommitIndex(demoted)).isEqualTo(getCommitIndex(leader));
+        });
+
+        allTheTime(() -> {
+            assertThat(getTerm(leader)).isEqualTo(term);
+            assertThat(leader.getLeaderEndpoint()).isEqualTo(leader.getLocalEndpoint());
+        }, 3);
+    }
+
+    @Timeout(300)
+    @Test
+    public void when_uncommittedDemotionIsTruncated_then_demotedFollowerRevertsToVoter() {
+        group = LocalRaftGroup.newBuilder(5).setConfig(TEST_RAFT_CONFIG).start();
+
+        RaftNodeImpl leader = group.waitUntilLeaderElected();
+        leader.replicate(applyValue("val1")).join();
+
+        RaftNodeImpl demoted = group.getAnyNodeExcept(leader.getLocalEndpoint());
+        long membersIndex = getCommittedGroupMembers(leader).getLogIndex();
+
+        // the old leader and the demoted follower are cut off from the majority,
+        // so the demotion can be appended on both but cannot be committed.
+        group.splitMembers(leader.getLocalEndpoint(), demoted.getLocalEndpoint());
+        leader.changeMembership(demoted.getLocalEndpoint(), DEMOTE_TO_LEARNER, membersIndex);
+
+        eventually(() -> assertThat(getRole(demoted)).isEqualTo(LEARNER));
+        assertThat(getCommittedGroupMembers(demoted).getVotingMembers()).contains(demoted.getLocalEndpoint());
+
+        // the majority side elects a new leader that never saw the demotion
+        eventually(() -> {
+            RaftEndpoint newLeaderEndpoint = null;
+            for (RaftNodeImpl node : group.<RaftNodeImpl>getNodes()) {
+                if (node != leader && node != demoted && node.getLeaderEndpoint() != null
+                        && !node.getLeaderEndpoint().equals(leader.getLocalEndpoint())) {
+                    newLeaderEndpoint = node.getLeaderEndpoint();
+                }
+            }
+            assertNotNull(newLeaderEndpoint);
+        });
+
+        RaftNodeImpl newLeader = null;
+        for (RaftNodeImpl node : group.<RaftNodeImpl>getNodes()) {
+            if (node != leader && node != demoted && node.getLeaderEndpoint() != null
+                    && node.getLeaderEndpoint().equals(node.getLocalEndpoint())) {
+                newLeader = node;
+            }
+        }
+        assertNotNull(newLeader);
+        newLeader.replicate(applyValue("val2")).join();
+
+        group.merge();
+
+        RaftNodeImpl finalNewLeader = newLeader;
+        eventually(() -> {
+            assertThat(getRole(demoted)).isEqualTo(FOLLOWER);
+            assertThat(getEffectiveGroupMembers(demoted).getVotingMembers()).contains(demoted.getLocalEndpoint());
+            assertThat(getCommitIndex(demoted)).isEqualTo(getCommitIndex(finalNewLeader));
+            assertThat(group.getStateMachine(demoted.getLocalEndpoint()).valueList()).containsExactly("val1",
+                    "val2");
+        });
     }
 
     @Timeout(300)
