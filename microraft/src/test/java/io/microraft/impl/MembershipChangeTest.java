@@ -19,6 +19,7 @@ package io.microraft.impl;
 
 import static io.microraft.MembershipChangeMode.ADD_LEARNER;
 import static io.microraft.MembershipChangeMode.ADD_OR_PROMOTE_TO_FOLLOWER;
+import static io.microraft.MembershipChangeMode.DEMOTE_TO_LEARNER;
 import static io.microraft.MembershipChangeMode.REMOVE_MEMBER;
 import static io.microraft.RaftNodeStatus.ACTIVE;
 import static io.microraft.RaftNodeStatus.TERMINATED;
@@ -194,6 +195,71 @@ public class MembershipChangeTest extends BaseTest {
 
         Map<RaftEndpoint, Long> heartbeatTimestamps = leader.getReport().join().getResult().getHeartbeatTimestamps();
         assertThat(heartbeatTimestamps).containsKey(newNode.getLocalEndpoint());
+    }
+
+    @Timeout(300)
+    @Test
+    public void when_followerIsDemoted_then_itBecomesLearnerAndKeepsReplicating() {
+        group = LocalRaftGroup.start(3);
+
+        RaftNodeImpl leader = group.waitUntilLeaderElected();
+        leader.replicate(applyValue("val1")).join();
+
+        RaftNodeImpl demoted = group.getAnyNodeExcept(leader.getLocalEndpoint());
+        long membersIndex = leader.getCommittedMembers().getLogIndex();
+
+        Ordered<RaftGroupMembers> result = leader
+                .changeMembership(demoted.getLocalEndpoint(), DEMOTE_TO_LEARNER, membersIndex).join();
+
+        assertThat(result.getResult().getMembers()).contains(demoted.getLocalEndpoint());
+        assertThat(result.getResult().getVotingMembers()).doesNotContain(demoted.getLocalEndpoint());
+        assertThat(result.getResult().getMajorityQuorumSize()).isEqualTo(majority(2));
+
+        eventually(() -> {
+            assertThat(getRole(demoted)).isEqualTo(LEARNER);
+            assertThat(getStatus(demoted)).isEqualTo(ACTIVE);
+            assertThat(getCommittedGroupMembers(demoted).getVotingMembers()).doesNotContain(demoted.getLocalEndpoint());
+        });
+
+        leader.replicate(applyValue("val2")).join();
+        long commitIndex = getCommitIndex(leader);
+        eventually(() -> assertThat(getCommitIndex(demoted)).isEqualTo(commitIndex));
+        assertThat(group.getStateMachine(demoted.getLocalEndpoint()).valueSet()).contains("val1", "val2");
+
+        // the same identity can be promoted back
+        Ordered<RaftGroupMembers> promoted = leader.changeMembership(demoted.getLocalEndpoint(),
+                ADD_OR_PROMOTE_TO_FOLLOWER, result.getCommitIndex()).join();
+        assertThat(promoted.getResult().getVotingMembers()).contains(demoted.getLocalEndpoint());
+        eventually(() -> assertThat(getRole(demoted)).isEqualTo(FOLLOWER));
+    }
+
+    @Timeout(300)
+    @Test
+    public void when_leaderIsDemoted_then_demotionFails() {
+        group = LocalRaftGroup.start(3);
+
+        RaftNodeImpl leader = group.waitUntilLeaderElected();
+        leader.replicate(applyValue("val")).join();
+        long membersIndex = leader.getCommittedMembers().getLogIndex();
+
+        assertThatThrownBy(
+                () -> leader.changeMembership(leader.getLocalEndpoint(), DEMOTE_TO_LEARNER, membersIndex).join())
+                .hasCauseInstanceOf(IllegalStateException.class);
+    }
+
+    @Timeout(300)
+    @Test
+    public void when_learnerIsDemoted_then_demotionFails() {
+        group = LocalRaftGroup.start(3);
+
+        RaftNodeImpl leader = group.waitUntilLeaderElected();
+        leader.replicate(applyValue("val")).join();
+        RaftNodeImpl newNode = group.createNewNode();
+        long index = leader.changeMembership(newNode.getLocalEndpoint(), ADD_LEARNER, 0).join().getCommitIndex();
+
+        assertThatThrownBy(
+                () -> leader.changeMembership(newNode.getLocalEndpoint(), DEMOTE_TO_LEARNER, index).join())
+                .hasCauseInstanceOf(IllegalArgumentException.class);
     }
 
     @Timeout(300)

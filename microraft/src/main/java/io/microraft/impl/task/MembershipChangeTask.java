@@ -43,7 +43,7 @@ import io.microraft.model.groupop.RaftGroupOp;
 import io.microraft.model.groupop.UpdateRaftGroupMembersOp;
 
 /**
- * Executed to add or remove a member to the Raft group.
+ * Executed to add, remove, or demote a member of the Raft group.
  * <p>
  * If the membership change mode is {@link MembershipChangeMode#ADD_LEARNER} but
  * the given member already exists in the Raft group, or the membership change
@@ -54,6 +54,12 @@ import io.microraft.model.groupop.UpdateRaftGroupMembersOp;
  * If the membership change mode is {@link MembershipChangeMode#REMOVE_MEMBER}
  * but the member does not exist in the Raft group, then the future is notified
  * with {@link IllegalStateException}.
+ * <p>
+ * If the membership change mode is
+ * {@link MembershipChangeMode#DEMOTE_TO_LEARNER} but the given member is not a
+ * voting member of the Raft group, then the future is notified with
+ * {@link IllegalArgumentException}. The leader cannot demote itself, and a
+ * demotion cannot create more than {@code MAX_LEARNER_COUNT} learners.
  * <p>
  * This task creates an instance of {@link UpdateRaftGroupMembersOp} that
  * includes the requested membership change and the new member list of the Raft
@@ -145,6 +151,24 @@ public final class MembershipChangeTask implements Runnable {
                     }
 
                     members.remove(endpoint);
+                    votingMembers.remove(endpoint);
+                    break;
+                case DEMOTE_TO_LEARNER :
+                    if (!votingMembers.contains(endpoint)) {
+                        String msg = endpoint + " is not a voting member in group " + raftNode.getGroupId();
+                        future.fail(new IllegalArgumentException(msg));
+                        return;
+                    } else if (endpoint.equals(state.localEndpoint())) {
+                        String msg = "Leader " + endpoint + " cannot demote itself in group " + raftNode.getGroupId();
+                        future.fail(new IllegalStateException(msg));
+                        return;
+                    } else if (members.size() - votingMembers.size() >= MAX_LEARNER_COUNT) {
+                        String msg = "Cannot demote " + endpoint + " in group " + raftNode.getGroupId() + " as 3rd "
+                                + LEARNER;
+                        future.fail(new IllegalStateException(msg));
+                        return;
+                    }
+
                     votingMembers.remove(endpoint);
                     break;
                 default :

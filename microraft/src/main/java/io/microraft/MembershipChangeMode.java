@@ -44,6 +44,16 @@ public enum MembershipChangeMode {
     /**
      * Denotes that a Raft endpoint will be removed from the Raft group.
      */
-    REMOVE_MEMBER
+    REMOVE_MEMBER,
+
+    /**
+     * Denotes that an existing voting Raft endpoint will lose its vote and become a
+     * {@link RaftRole#LEARNER}, while staying in the Raft group with its identity.
+     * The quorum size of the Raft group is re-calculated based on the new number of
+     * voting members. A demoted endpoint keeps receiving log entries and can be
+     * promoted again via {@link #ADD_OR_PROMOTE_TO_FOLLOWER}. The leader cannot
+     * demote itself.
+     */
+    DEMOTE_TO_LEARNER
 
 }

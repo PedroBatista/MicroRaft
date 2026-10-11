@@ -666,6 +666,14 @@ public final class RaftState {
             } catch (IOException e) {
                 throw new RaftException("Promotion to voting member failed", null, e);
             }
+        } else if (role != LEARNER && role != LEADER
+                && !effectiveGroupMembers.getVotingMembers().contains(this.localEndpoint)) {
+            // the local endpoint is demoted via a DEMOTE_TO_LEARNER membership change
+            try {
+                demoteToNonVotingMember();
+            } catch (IOException e) {
+                throw new RaftException("Demotion to non-voting member failed", null, e);
+            }
         }
     }
 
@@ -695,6 +703,16 @@ public final class RaftState {
                 demoteToNonVotingMember();
             } catch (IOException e) {
                 throw new RaftException("Demotion to non-voting member failed", null, e);
+            }
+        }
+        boolean promoteToVotingMember = this.role == LEARNER
+                && this.committedGroupMembers.getVotingMembers().contains(this.localEndpoint)
+                && !this.effectiveGroupMembers.getVotingMembers().contains(this.localEndpoint);
+        if (promoteToVotingMember) {
+            try {
+                promoteToVotingMember();
+            } catch (IOException e) {
+                throw new RaftException("Promotion to voting member failed", null, e);
             }
         }
         this.effectiveGroupMembers = this.committedGroupMembers;
